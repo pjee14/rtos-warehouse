@@ -180,17 +180,23 @@ static void *display_task(void *arg) {
     return NULL;
 }
 
-/* Alert:庫存不足警報 */
 static void *alert_task(void *arg) {
     while (1) {
         alert_evt_t e = alert_wait();
-        dev_set_led(1); dev_set_buzzer(1);        /* 實體版閃燈鳴笛;虛擬版靜默 */
         if (e.reason == 1)
             printf("  !! 警報:%s 庫存不足(現有 %d,要求出貨 %d)→ 拒絕出貨\n",
                    ITEMS[e.type].name, e.level, e.requested);
         else
             printf("  !! 警報:%s 低於安全庫存(剩 %d,門檻 %d)\n",
                    ITEMS[e.type].name, e.level, e.threshold);
+
+        /* 閃燈 + 鳴笛:嗶 3 短聲(實體才有作用,虛擬靜默) */
+        for (int i = 0; i < 3; i++) {
+            dev_set_led(1); dev_set_buzzer(1);
+            usleep(120000);
+            dev_set_led(0); dev_set_buzzer(0);
+            usleep(120000);
+        }
     }
     return NULL;
 }

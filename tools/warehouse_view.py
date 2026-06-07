@@ -38,8 +38,11 @@ class WarehouseView:
     def parse(self, text):
         inv = {}
         for line in text.splitlines():
-            m = re.search(r"(醫療物資|生鮮食品|一般貨物):\s*(\d+)\s*\(門檻\s*(\d+)\)", line)
-            if m: inv[m.group(1)] = (int(m.group(2)), int(m.group(3)))
+            m = re.search(
+                r"(醫療物資|生鮮食品|一般貨物):\s*現有\s*(\d+).*?\(門檻\s*(\d+)\)",
+                line)
+            if m:
+                inv[m.group(1)] = (int(m.group(2)), int(m.group(3)))
         return inv
 
     # ---- 漸層工具 ----
@@ -124,7 +127,7 @@ class WarehouseView:
             for i in range(vis):
                 self.carton(cx, FLOOR - 8 - i*30, kind, low, i == vis-1)
             if qty > 7:
-                c.create_text(cx, FLOOR - 8 - 7*30 - 16,
+                c.create_text(cx, FLOOR - 8 - 7*30 - 16,text=f"+{qty-7}",
                               fill="white", font=("Sans", 10, "bold"))
             c.create_text(cx, FLOOR+26, text=label, fill="white", font=("Sans", 13, "bold"))
             c.create_text(cx, FLOOR+48, text=f"庫存 {qty}  (門檻 {th})",
