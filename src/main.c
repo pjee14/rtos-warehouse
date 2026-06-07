@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <sched.h>
@@ -19,6 +20,7 @@
 #define PRIO_HIGH   80
 #define PRIO_MEDIUM 50
 #define PRIO_LOW    20
+#define INVENTORY_WORKERS 3
 
 static volatile sig_atomic_t g_running = 1;
 static void on_sigint(int sig) { (void)sig; g_running = 0; }   /* handler 只設旗標 */
@@ -32,6 +34,7 @@ static const item_info_t ITEMS[ITEM_TYPE_COUNT] = {
 static pqueue_t        scan_q;
 static mempool_t       msg_pool;
 static int             inventory[ITEM_TYPE_COUNT] = {0};
+static int             reserved_out[ITEM_TYPE_COUNT] = {0};
 static pthread_mutex_t inv_lock;
 
 /* ===== Inventory → Alert 警報通道 ===== */
@@ -47,17 +50,20 @@ typedef struct {
 static alert_evt_t     alert_buf[ALERT_CAP];
 static int             alert_count = 0;
 static pthread_mutex_t alert_lock = PTHREAD_MUTEX_INITIALIZER;
-static sem_t           alert_sem;
+static pthread_cond_t  alert_not_empty = PTHREAD_COND_INITIALIZER;
 
 static void alert_post(alert_evt_t e) {
     pthread_mutex_lock(&alert_lock);
-    if (alert_count < ALERT_CAP) alert_buf[alert_count++] = e;
+    if (alert_count < ALERT_CAP) {
+        alert_buf[alert_count++] = e;
+        pthread_cond_signal(&alert_not_empty);
+    }
     pthread_mutex_unlock(&alert_lock);
-    sem_post(&alert_sem);
 }
 static alert_evt_t alert_wait(void) {
-    sem_wait(&alert_sem);
     pthread_mutex_lock(&alert_lock);
+    while (alert_count == 0)
+        pthread_cond_wait(&alert_not_empty, &alert_lock);
     alert_evt_t e = alert_buf[0];
     for (int i = 1; i < alert_count; i++) alert_buf[i-1] = alert_buf[i];
     alert_count--;
@@ -82,28 +88,39 @@ static int prep_seconds(item_type_t t) {
 }
 
 static void *inventory_task(void *arg) {
+    int worker_id = (int)(intptr_t)arg;
     while (1) {
+        int available[ITEM_TYPE_COUNT];
+        pthread_mutex_lock(&inv_lock);
+        for (int i = 0; i < ITEM_TYPE_COUNT; i++)
+            available[i] = inventory[i] - reserved_out[i];
+        pthread_mutex_unlock(&inv_lock);
+
         int waiting;
-        scan_msg_t *m = pq_pop_priority(&scan_q, inventory, &waiting);
+        scan_msg_t *m = pq_pop_priority(&scan_q, available, &waiting);
         int th = ITEMS[m->type].threshold;
         const char *nm = ITEMS[m->type].name;
         char reply[200];
 
         if (waiting > 1)
-            printf("  [排程] 佇列有 %d 筆,依規則挑出:%s(優先=%d, 數量=%d)\n",
-                   waiting, nm, m->priority, m->amount);
+            printf("  [排程][員工%d] 佇列有 %d 筆,依規則挑出:%s(優先=%d, 數量=%d)\n",
+                   worker_id, waiting, nm, m->priority, m->amount);
 
-        /* 1) 鎖內先檢查出貨庫存是否足夠 */
+        /* 1) 鎖內先檢查出貨可用庫存是否足夠,足夠就保留 */
         pthread_mutex_lock(&inv_lock);
-        int cur = inventory[m->type];
+        int cur = inventory[m->type] - reserved_out[m->type];
         int rejected = (m->action == ACTION_OUT && m->amount > cur);
+        if (!rejected && m->action == ACTION_OUT) {
+            reserved_out[m->type] += m->amount;
+        }
         pthread_mutex_unlock(&inv_lock);
 
         if (rejected) {
-            printf("  !! %s 出貨 %d 遭拒:庫存不足(現有 %d)\n", nm, m->amount, cur);
+            printf("  !! [員工%d] %s 出貨 %d 遭拒:可用庫存不足(可用 %d)\n",
+                   worker_id, nm, m->amount, cur);
             alert_evt_t e; e.type=m->type; e.level=cur; e.threshold=th; e.reason=1; e.requested=m->amount;
             alert_post(e);
-            snprintf(reply, sizeof(reply), "[結果] %s 出貨 %d 遭拒:庫存不足(現有 %d)\n", nm, m->amount, cur);
+            snprintf(reply, sizeof(reply), "[結果] %s 出貨 %d 遭拒:可用庫存不足(可用 %d)\n", nm, m->amount, cur);
             net_send(m->reply_fd, reply);
             mempool_free(&msg_pool, m);
             continue;                          /* 被拒不需備貨時間 */
@@ -111,10 +128,11 @@ static void *inventory_task(void *arg) {
 
         /* 2) 受理 → 模擬備貨時間(鎖外,不卡住查詢) */
         int secs = prep_seconds(m->type);
-        printf("  [處理中] %s %s %d,備貨 %d 秒...\n", nm, action_name(m->action), m->amount, secs);
+        printf("  [處理中][員工%d] %s %s %d,備貨 %d 秒...\n",
+               worker_id, nm, action_name(m->action), m->amount, secs);
         if (m->reply_fd >= 0) {
-            snprintf(reply, sizeof(reply), "[處理中] %s %s %d,預計 %d 秒...\n",
-                     nm, action_name(m->action), m->amount, secs);
+            snprintf(reply, sizeof(reply), "[處理中][員工%d] %s %s %d,預計 %d 秒...\n",
+                     worker_id, nm, action_name(m->action), m->amount, secs);
             net_send(m->reply_fd, reply);
         }
         sleep(secs);
@@ -122,16 +140,22 @@ static void *inventory_task(void *arg) {
         /* 3) 備貨完成 → 鎖內提交庫存變動 */
         pthread_mutex_lock(&inv_lock);
         if (m->action == ACTION_IN) inventory[m->type] += m->amount;
-        else                        inventory[m->type] -= m->amount;
+        else {
+            inventory[m->type] -= m->amount;
+            reserved_out[m->type] -= m->amount;
+        }
         int now = inventory[m->type];
+        int avail_now = inventory[m->type] - reserved_out[m->type];
         pthread_mutex_unlock(&inv_lock);
 
-        printf("  %s %s %d 完成 → 現有 %d\n", nm, action_name(m->action), m->amount, now);
-        snprintf(reply, sizeof(reply), "[結果] %s %s %d 完成,現有 %d\n", nm, action_name(m->action), m->amount, now);
+        printf("  [員工%d] %s %s %d 完成 → 現有 %d,可用 %d\n",
+               worker_id, nm, action_name(m->action), m->amount, now, avail_now);
+        snprintf(reply, sizeof(reply), "[結果][員工%d] %s %s %d 完成,現有 %d,可用 %d\n",
+                 worker_id, nm, action_name(m->action), m->amount, now, avail_now);
         net_send(m->reply_fd, reply);
 
-        if (m->action == ACTION_OUT && now < th) {
-            alert_evt_t e; e.type=m->type; e.level=now; e.threshold=th; e.reason=0; e.requested=0;
+        if (m->action == ACTION_OUT && avail_now < th) {
+            alert_evt_t e; e.type=m->type; e.level=avail_now; e.threshold=th; e.reason=0; e.requested=0;
             alert_post(e);
         }
         mempool_free(&msg_pool, m);
@@ -192,17 +216,21 @@ static void net_send(int fd, const char *msg) {
 
 static void inventory_snapshot_str(char *out, size_t n) {
     int snap[ITEM_TYPE_COUNT];
+    int reserved[ITEM_TYPE_COUNT];
     pthread_mutex_lock(&inv_lock);
-    for (int i = 0; i < ITEM_TYPE_COUNT; i++) snap[i] = inventory[i];
+    for (int i = 0; i < ITEM_TYPE_COUNT; i++) {
+        snap[i] = inventory[i];
+        reserved[i] = reserved_out[i];
+    }
     pthread_mutex_unlock(&inv_lock);
     snprintf(out, n,
         "=== 庫存查詢結果 ===\n"
-        "  醫療物資: %d (門檻 %d)\n"
-        "  生鮮食品: %d (門檻 %d)\n"
-        "  一般貨物: %d (門檻 %d)\n",
-        snap[ITEM_MEDICAL],  ITEMS[ITEM_MEDICAL].threshold,
-        snap[ITEM_FRESH],    ITEMS[ITEM_FRESH].threshold,
-        snap[ITEM_GENERAL],  ITEMS[ITEM_GENERAL].threshold);
+        "  醫療物資: 現有 %d / 保留出貨 %d / 可用 %d (門檻 %d)\n"
+        "  生鮮食品: 現有 %d / 保留出貨 %d / 可用 %d (門檻 %d)\n"
+        "  一般貨物: 現有 %d / 保留出貨 %d / 可用 %d (門檻 %d)\n",
+        snap[ITEM_MEDICAL], reserved[ITEM_MEDICAL], snap[ITEM_MEDICAL] - reserved[ITEM_MEDICAL], ITEMS[ITEM_MEDICAL].threshold,
+        snap[ITEM_FRESH],   reserved[ITEM_FRESH],   snap[ITEM_FRESH] - reserved[ITEM_FRESH],     ITEMS[ITEM_FRESH].threshold,
+        snap[ITEM_GENERAL], reserved[ITEM_GENERAL], snap[ITEM_GENERAL] - reserved[ITEM_GENERAL], ITEMS[ITEM_GENERAL].threshold);
 }
 
 static void *socket_task(void *arg) {
@@ -283,14 +311,14 @@ static void *socket_task(void *arg) {
     return NULL;
 }
 
-static int create_rt_task(pthread_t *tid, void *(*fn)(void *), int prio, const char *name) {
+static int create_rt_task_arg(pthread_t *tid, void *(*fn)(void *), void *arg, int prio, const char *name) {
     pthread_attr_t attr; struct sched_param param;
     pthread_attr_init(&attr);
     pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
     pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
     param.sched_priority = prio;
     pthread_attr_setschedparam(&attr, &param);
-    int rc = pthread_create(tid, &attr, fn, NULL);
+    int rc = pthread_create(tid, &attr, fn, arg);
     pthread_attr_destroy(&attr);
     if (rc != 0) {
         fprintf(stderr, "建立 %s 失敗: %s\n", name, strerror(rc));
@@ -298,6 +326,10 @@ static int create_rt_task(pthread_t *tid, void *(*fn)(void *), int prio, const c
         return -1;
     }
     return 0;
+}
+
+static int create_rt_task(pthread_t *tid, void *(*fn)(void *), int prio, const char *name) {
+    return create_rt_task_arg(tid, fn, NULL, prio, name);
 }
 
 static void init_inventory_lock(void) {
@@ -309,15 +341,17 @@ static void init_inventory_lock(void) {
 }
 
 int main(void) {
-    pthread_t inv_tid, display, alert, sock;
+    pthread_t inv_tid[INVENTORY_WORKERS], display, alert, sock;
 
     pq_init(&scan_q);
     mempool_init(&msg_pool);
     init_inventory_lock();
-    sem_init(&alert_sem, 0, 0);
     dev_init();
 
-    for (int i = 0; i < ITEM_TYPE_COUNT; i++) inventory[i] = 5;   /* 初始庫存皆 5 */
+    for (int i = 0; i < ITEM_TYPE_COUNT; i++) {
+        inventory[i] = 5;   /* 初始庫存皆 5 */
+        reserved_out[i] = 0;
+    }
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -328,11 +362,17 @@ int main(void) {
     printf("=== 智慧倉庫系統(Server)===\n");
     printf("初始庫存:醫療 5、生鮮 5、一般 5\n");
     printf("備貨時間:醫療 3 秒、生鮮 5 秒、一般 8 秒\n");
+    printf("同時作業員工:%d 人\n", INVENTORY_WORKERS);
     printf("遠端連線:nc 127.0.0.1 9000  (query / in / out)\n");
     printf("按 Ctrl+C 結束\n\n");
 
     if (create_rt_task(&alert,   alert_task,     PRIO_HIGH,   "Alert")     != 0) return 1;
-    if (create_rt_task(&inv_tid, inventory_task, PRIO_MEDIUM, "Inventory") != 0) return 1;
+    for (int i = 0; i < INVENTORY_WORKERS; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "Inventory-%d", i + 1);
+        if (create_rt_task_arg(&inv_tid[i], inventory_task, (void *)(intptr_t)(i + 1),
+                               PRIO_MEDIUM, name) != 0) return 1;
+    }
     if (create_rt_task(&sock,    socket_task,    PRIO_MEDIUM, "Socket")    != 0) return 1;
     if (create_rt_task(&display, display_task,   PRIO_LOW,    "Display")   != 0) return 1;
 
@@ -348,3 +388,4 @@ int main(void) {
     printf("=== 系統已關閉 ===\n");
     return 0;
 }
+
