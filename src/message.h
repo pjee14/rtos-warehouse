@@ -21,6 +21,7 @@ typedef struct {
     action_t    action;     /* 進貨 / 出貨 */
     int         amount;     /* 數量 */
     int         priority;   /* 貨物優先序:數字越大越優先 */
+    int         reply_fd;   /* 要回報結果的 client fd;Scanner 用 -1 表示不需回覆 */
 } scan_msg_t;
 
 /* 每種貨物的靜態屬性 */

@@ -65,59 +65,74 @@ static alert_evt_t alert_wait(void) {
     return e;
 }
 
+/* ===== 網路寫入保護(多執行緒可能同時寫 client) ===== */
+static pthread_mutex_t net_lock = PTHREAD_MUTEX_INITIALIZER;
+static int  send_all(int fd, const char *data, size_t len);   /* 前置宣告 */
+static void net_send(int fd, const char *msg);
+
 static const char *action_name(action_t a) { return a == ACTION_IN ? "進貨" : "出貨"; }
 
-static void *scanner_task(void *arg) {
-    srand(time(NULL));
-    while (g_running) {
-        scan_msg_t *m = mempool_alloc(&msg_pool);
-        m->type     = rand() % ITEM_TYPE_COUNT;
-        m->action   = rand() % 2;
-        m->amount   = 1 + rand() % 5;
-        m->priority = ITEMS[m->type].priority;
-        printf("[Scanner] 掃描: %s %s x%d\n",
-               ITEMS[m->type].name, action_name(m->action), m->amount);
-        pq_push(&scan_q, m);
-        sleep(2);                 /* 每 2 秒模擬一筆 */
+static int prep_seconds(item_type_t t) {
+    switch (t) {
+        case ITEM_MEDICAL: return 3;   /* 醫療 3 秒 */
+        case ITEM_FRESH:   return 5;   /* 生鮮 5 秒 */
+        case ITEM_GENERAL: return 8;   /* 一般 8 秒 */
+        default:           return 1;
     }
-    return NULL;
 }
 
 static void *inventory_task(void *arg) {
     while (1) {
-        scan_msg_t *m = pq_pop(&scan_q);
+        int waiting;
+        scan_msg_t *m = pq_pop_priority(&scan_q, inventory, &waiting);
         int th = ITEMS[m->type].threshold;
+        const char *nm = ITEMS[m->type].name;
+        char reply[200];
 
+        if (waiting > 1)
+            printf("  [排程] 佇列有 %d 筆,依規則挑出:%s(優先=%d, 數量=%d)\n",
+                   waiting, nm, m->priority, m->amount);
+
+        /* 1) 鎖內先檢查出貨庫存是否足夠 */
         pthread_mutex_lock(&inv_lock);
         int cur = inventory[m->type];
-        int rejected = 0, now = cur;
-        if (m->action == ACTION_IN) {
-            inventory[m->type] += m->amount;
-            now = inventory[m->type];
-        } else {                                  /* 出貨 */
-            if (m->amount > cur) {
-                rejected = 1;                     /* 庫存不足,不扣帳 */
-            } else {
-                inventory[m->type] -= m->amount;
-                now = inventory[m->type];
-            }
-        }
+        int rejected = (m->action == ACTION_OUT && m->amount > cur);
         pthread_mutex_unlock(&inv_lock);
 
         if (rejected) {
-            alert_evt_t e;
-            e.type = m->type; e.level = cur; e.threshold = th;
-            e.reason = 1; e.requested = m->amount;
-            alert_post(e);                        /* 交給 Alert 顯示「庫存不足」 */
-        } else {
-            printf("  %s %s %d → 現有 %d\n",
-                   ITEMS[m->type].name, action_name(m->action), m->amount, now);
-            if (m->action == ACTION_OUT && now < th) {
-                alert_evt_t e;
-                e.type = m->type; e.level = now; e.threshold = th;
-                e.reason = 0; e.requested = 0;
-                alert_post(e);
-            }
+            printf("  !! %s 出貨 %d 遭拒:庫存不足(現有 %d)\n", nm, m->amount, cur);
+            alert_evt_t e; e.type=m->type; e.level=cur; e.threshold=th; e.reason=1; e.requested=m->amount;
+            alert_post(e);
+            snprintf(reply, sizeof(reply), "[結果] %s 出貨 %d 遭拒:庫存不足(現有 %d)\n", nm, m->amount, cur);
+            net_send(m->reply_fd, reply);
+            mempool_free(&msg_pool, m);
+            continue;                          /* 被拒不需備貨時間 */
+        }
+
+        /* 2) 受理 → 模擬備貨時間(鎖外,不卡住查詢) */
+        int secs = prep_seconds(m->type);
+        printf("  [處理中] %s %s %d,備貨 %d 秒...\n", nm, action_name(m->action), m->amount, secs);
+        if (m->reply_fd >= 0) {
+            snprintf(reply, sizeof(reply), "[處理中] %s %s %d,預計 %d 秒...\n",
+                     nm, action_name(m->action), m->amount, secs);
+            net_send(m->reply_fd, reply);
+        }
+        sleep(secs);
+
+        /* 3) 備貨完成 → 鎖內提交庫存變動 */
+        pthread_mutex_lock(&inv_lock);
+        if (m->action == ACTION_IN) inventory[m->type] += m->amount;
+        else                        inventory[m->type] -= m->amount;
+        int now = inventory[m->type];
+        pthread_mutex_unlock(&inv_lock);
+
+        printf("  %s %s %d 完成 → 現有 %d\n", nm, action_name(m->action), m->amount, now);
+        snprintf(reply, sizeof(reply), "[結果] %s %s %d 完成,現有 %d\n", nm, action_name(m->action), m->amount, now);
+        net_send(m->reply_fd, reply);
+
+        if (m->action == ACTION_OUT && now < th) {
+            alert_evt_t e; e.type=m->type; e.level=now; e.threshold=th; e.reason=0; e.requested=0;
+            alert_post(e);
         }
         mempool_free(&msg_pool, m);
     }
@@ -168,6 +183,13 @@ static int send_all(int fd, const char *data, size_t len) {
     return 0;
 }
 
+static void net_send(int fd, const char *msg) {
+    if (fd < 0) return;                 /* reply_fd=-1(Scanner)不需回覆 */
+    pthread_mutex_lock(&net_lock);
+    send_all(fd, msg, strlen(msg));
+    pthread_mutex_unlock(&net_lock);
+}
+
 static void inventory_snapshot_str(char *out, size_t n) {
     int snap[ITEM_TYPE_COUNT];
     pthread_mutex_lock(&inv_lock);
@@ -214,20 +236,45 @@ static void *socket_task(void *arg) {
                 if (connfd < 0) continue;
                 FD_SET(connfd, &master);
                 if (connfd > maxfd) maxfd = connfd;
-                const char *w = "歡迎連線智慧倉庫,輸入任意字查庫存,quit 離開\n";
-                send_all(connfd, w, strlen(w));
+                net_send(connfd,
+                    "=== 智慧倉庫連線成功 ===\n"
+                    "  查詢: query\n"
+                    "  進貨: in  med/food/goods 數量\n"
+                    "  出貨: out med/food/goods 數量\n"
+                    "  離開: quit\n");
             } else {
                 char buf[128];
                 ssize_t n = read(fd, buf, sizeof(buf) - 1);
-                if (n <= 0) { close(fd); FD_CLR(fd, &master); }
-                else {
-                    buf[n] = '\0'; buf[strcspn(buf, "\r\n")] = '\0';
-                    if (strncmp(buf, "quit", 4) == 0) { close(fd); FD_CLR(fd, &master); }
-                    else {
-                        char reply[512];
-                        inventory_snapshot_str(reply, sizeof(reply));
-                        send_all(fd, reply, strlen(reply));
+                if (n <= 0) { close(fd); FD_CLR(fd, &master); continue; }
+                buf[n] = '\0'; buf[strcspn(buf, "\r\n")] = '\0';
+
+                char cmd[16] = {0}, item[16] = {0}; int amt = 0;
+                int k = sscanf(buf, " %15s %15s %d", cmd, item, &amt);
+
+                if (k >= 1 && strcmp(cmd, "quit") == 0) {
+                    close(fd); FD_CLR(fd, &master);
+                } else if (k >= 1 && (strcmp(cmd, "in") == 0 || strcmp(cmd, "out") == 0)) {
+                    item_type_t type; int ok = 1;
+                    if      (strcmp(item, "med")   == 0) type = ITEM_MEDICAL;
+                    else if (strcmp(item, "food")  == 0) type = ITEM_FRESH;
+                    else if (strcmp(item, "goods") == 0) type = ITEM_GENERAL;
+                    else ok = 0;
+                    if (k != 3 || amt <= 0 || !ok) {
+                        net_send(fd, "格式: in/out  med/food/goods  數量  (例: out med 3)\n");
+                    } else {
+                        scan_msg_t *m = mempool_alloc(&msg_pool);
+                        m->type     = type;
+                        m->action   = (cmd[0] == 'i') ? ACTION_IN : ACTION_OUT;
+                        m->amount   = amt;
+                        m->priority = ITEMS[type].priority;
+                        m->reply_fd = fd;                  /* 處理完回報這個 client */
+                        pq_push(&scan_q, m);               /* 依優先權排隊 */
+                        net_send(fd, "已收到,依貨物優先權排入佇列處理...\n");
                     }
+                } else {
+                    char snap[512];
+                    inventory_snapshot_str(snap, sizeof(snap));
+                    net_send(fd, snap);
                 }
             }
         }
@@ -262,47 +309,42 @@ static void init_inventory_lock(void) {
 }
 
 int main(void) {
-    pthread_t scanner, inv_tid, display, alert, sock;
+    pthread_t inv_tid, display, alert, sock;
 
     pq_init(&scan_q);
     mempool_init(&msg_pool);
     init_inventory_lock();
-    for (int i = 0; i < ITEM_TYPE_COUNT; i++) inventory[i] = 5;   /* 初始庫存皆 5 */
     sem_init(&alert_sem, 0, 0);
     dev_init();
 
-    /* 安裝 SIGINT 處理函式(Ctrl+C) */
+    for (int i = 0; i < ITEM_TYPE_COUNT; i++) inventory[i] = 5;   /* 初始庫存皆 5 */
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_sigint;
     sigaction(SIGINT, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
 
-    printf("=== 智慧倉庫系統 ===\n");
-    printf("Task 優先權(SCHED_FIFO): Alert/Scanner=80  Inventory/Socket=50  Display=20\n");
-    printf("系統自動模擬進出貨中... 按 Ctrl+C 結束\n");
-    printf("遠端查詢: 另開終端機 nc 127.0.0.1 9000\n\n");
+    printf("=== 智慧倉庫系統(Server)===\n");
+    printf("初始庫存:醫療 5、生鮮 5、一般 5\n");
+    printf("備貨時間:醫療 3 秒、生鮮 5 秒、一般 8 秒\n");
+    printf("遠端連線:nc 127.0.0.1 9000  (query / in / out)\n");
+    printf("按 Ctrl+C 結束\n\n");
 
     if (create_rt_task(&alert,   alert_task,     PRIO_HIGH,   "Alert")     != 0) return 1;
-    if (create_rt_task(&scanner, scanner_task,   PRIO_HIGH,   "Scanner")   != 0) return 1;
     if (create_rt_task(&inv_tid, inventory_task, PRIO_MEDIUM, "Inventory") != 0) return 1;
     if (create_rt_task(&sock,    socket_task,    PRIO_MEDIUM, "Socket")    != 0) return 1;
     if (create_rt_task(&display, display_task,   PRIO_LOW,    "Display")   != 0) return 1;
 
-    /* 等待結束:q(Scanner 設旗標)或 Ctrl+C(SIGINT handler 設旗標) */
     while (g_running) usleep(200000);
 
-    /* ---- 結束程序 ---- */
     printf("\n=== 系統關閉中 ===\n");
-    dev_set_led(0);
-    dev_set_buzzer(0);
-    dev_show_number(0);
-
+    dev_set_led(0); dev_set_buzzer(0); dev_show_number(0);
     int snap[ITEM_TYPE_COUNT];
     pthread_mutex_lock(&inv_lock);
     for (int i = 0; i < ITEM_TYPE_COUNT; i++) snap[i] = inventory[i];
     pthread_mutex_unlock(&inv_lock);
-    printf("最終庫存 | 醫療:%d  生鮮:%d  一般:%d\n",
-           snap[ITEM_MEDICAL], snap[ITEM_FRESH], snap[ITEM_GENERAL]);
+    printf("最終庫存 | 醫療:%d  生鮮:%d  一般:%d\n", snap[ITEM_MEDICAL], snap[ITEM_FRESH], snap[ITEM_GENERAL]);
     printf("=== 系統已關閉 ===\n");
     return 0;
 }
