@@ -36,6 +36,7 @@ static mempool_t       msg_pool;
 static int             inventory[ITEM_TYPE_COUNT] = {0};
 static int             reserved_out[ITEM_TYPE_COUNT] = {0};
 static pthread_mutex_t inv_lock;
+static int             last_cat_count = -1;
 
 /* ===== Inventory → Alert 警報通道 ===== */
 #define ALERT_CAP 16
@@ -51,6 +52,8 @@ static alert_evt_t     alert_buf[ALERT_CAP];
 static int             alert_count = 0;
 static pthread_mutex_t alert_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  alert_not_empty = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t alarm_lock = PTHREAD_MUTEX_INITIALIZER;
+static int alarm_on = 0;
 
 static void alert_post(alert_evt_t e) {
     pthread_mutex_lock(&alert_lock);
@@ -146,6 +149,7 @@ static void *inventory_task(void *arg) {
         }
         int now = inventory[m->type];
         int avail_now = inventory[m->type] - reserved_out[m->type];
+        last_cat_count = now;
         pthread_mutex_unlock(&inv_lock);
 
         printf("  [員工%d] %s %s %d 完成 → 現有 %d,可用 %d\n",
@@ -165,16 +169,13 @@ static void *inventory_task(void *arg) {
 
 /* Display:庫存有變化才更新七段 */
 static void *display_task(void *arg) {
-    int last;
-    pthread_mutex_lock(&inv_lock);
-    last = 0; for (int i = 0; i < ITEM_TYPE_COUNT; i++) last += inventory[i];
-    pthread_mutex_unlock(&inv_lock);
+    int last_cat = -1;
     while (1) {
-        int total = 0;
+        int cat;
         pthread_mutex_lock(&inv_lock);
-        for (int i = 0; i < ITEM_TYPE_COUNT; i++) total += inventory[i];
+        cat = last_cat_count;
         pthread_mutex_unlock(&inv_lock);
-        if (total != last) { dev_show_number(total); last = total; }
+        if (cat != last_cat && cat >= 0) { dev_show_number(cat); last_cat = cat; }
         usleep(100000);
     }
     return NULL;
@@ -190,12 +191,27 @@ static void *alert_task(void *arg) {
             printf("  !! 警報:%s 低於安全庫存(剩 %d,門檻 %d)\n",
                    ITEMS[e.type].name, e.level, e.threshold);
 
-        /* 閃燈 + 鳴笛:嗶 3 短聲(實體才有作用,虛擬靜默) */
-        for (int i = 0; i < 3; i++) {
-            dev_set_led(1); dev_set_buzzer(1);
-            usleep(120000);
-            dev_set_led(0); dev_set_buzzer(0);
-            usleep(120000);
+        pthread_mutex_lock(&alarm_lock);
+        alarm_on = 1;
+        pthread_mutex_unlock(&alarm_lock);
+        dev_set_led(1);
+        dev_set_buzzer(1);                 /* 持續響,直到按鈕解除 */
+        printf("  >> 請按下按鈕解除警報\n");
+    }
+    return NULL;
+}
+
+static void *button_task(void *arg) {
+    while (1) {
+        dev_wait_button();                 /* 阻塞等按鈕(實體版=GPIO中斷) */
+        pthread_mutex_lock(&alarm_lock);
+        int was_on = alarm_on;
+        alarm_on = 0;
+        pthread_mutex_unlock(&alarm_lock);
+        if (was_on) {
+            dev_set_led(0);
+            dev_set_buzzer(0);
+            printf("  ✓ 警報已由管理員解除\n");
         }
     }
     return NULL;
@@ -347,7 +363,7 @@ static void init_inventory_lock(void) {
 }
 
 int main(void) {
-    pthread_t inv_tid[INVENTORY_WORKERS], display, alert, sock;
+    pthread_t inv_tid[INVENTORY_WORKERS], display, alert, sock, button;
 
     pq_init(&scan_q);
     mempool_init(&msg_pool);
@@ -372,7 +388,8 @@ int main(void) {
     printf("遠端連線:nc 127.0.0.1 9000  (query / in / out)\n");
     printf("按 Ctrl+C 結束\n\n");
 
-    if (create_rt_task(&alert,   alert_task,     PRIO_HIGH,   "Alert")     != 0) return 1;
+    if (create_rt_task(&alert,   alert_task,     PRIO_HIGH,   "Alert")      != 0) return 1;
+    if (create_rt_task(&button, button_task,    PRIO_HIGH,   "Button")     != 0) return 1;
     for (int i = 0; i < INVENTORY_WORKERS; i++) {
         char name[32];
         snprintf(name, sizeof(name), "Inventory-%d", i + 1);

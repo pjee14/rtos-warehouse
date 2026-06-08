@@ -1,6 +1,11 @@
 #include <stdio.h>
 #include "device.h"
-
+#include <stdio.h>
+void dev_wait_button(void) {
+    /* 虛擬版:在 server 終端機按 Enter 模擬按鈕 */
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) { }
+}
 void dev_init(void) { /* 虛擬裝置:免初始化 */ }
 
 void dev_show_number(int value) { printf("  [七段] 庫存總數 %d\n", value); }
