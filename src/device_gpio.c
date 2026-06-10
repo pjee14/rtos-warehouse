@@ -4,6 +4,16 @@
 #include <unistd.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <nfc/nfc.h>
+#include <string.h>
+#include <stdint.h>
+
+static nfc_device  *nfc_dev = NULL;
+static nfc_context *nfc_ctx = NULL;
+
+/* 你的授權卡 UID:92 68 c9 05 */
+static const uint8_t AUTH_UID[]   = {0x92, 0x68, 0xC9, 0x05};
+static const size_t  AUTH_UID_LEN = 4;
 
 /* ---- GPIO 腳位 (BCM 編號) ---- */
 #define LED_PIN     17
@@ -80,6 +90,16 @@ void dev_init(void) {
         btn_fd = open(vp, O_RDONLY);
     }
     printf("[GPIO] sysfs 初始化完成\n");
+    nfc_init(&nfc_ctx);
+    if (nfc_ctx) {
+        nfc_dev = nfc_open(nfc_ctx, NULL);    /* 用 /etc/nfc/libnfc.conf 設定的裝置 */
+        if (nfc_dev) {
+            nfc_initiator_init(nfc_dev);
+            printf("[NFC] PN532 就緒\n");
+        } else {
+            fprintf(stderr, "[NFC] 開啟 PN532 失敗(將以解鎖狀態啟動)\n");
+        }
+    }
 }
 
 void dev_set_led(int on)    { gpio_write(LED_PIN,    on ? 1 : 0); }
@@ -100,5 +120,25 @@ void dev_show_number(int n) {
     for (int i = 0; i < 7; i++) {
         int on = (tens > 0) && seg_code[tens][i];
         gpio_write(seg2_pins[i], on ? SEG_ON : SEG_OFF);
+    }
+}
+
+int dev_starts_locked(void) {
+    return nfc_dev ? 1 : 0;   /* 有讀卡機才鎖定;沒讀卡機就解鎖,避免被鎖死 */
+}
+
+int dev_wait_card(void) {
+    if (!nfc_dev) { sleep(1); return 0; }    /* 沒讀卡機 → 不誤觸發 */
+    const nfc_modulation nm = { .nmt = NMT_ISO14443A, .nbr = NBR_106 };
+    nfc_target nt;
+    while (1) {
+        if (nfc_initiator_select_passive_target(nfc_dev, nm, NULL, 0, &nt) > 0) {
+            if (nt.nti.nai.szUidLen == AUTH_UID_LEN &&
+                memcmp(nt.nti.nai.abtUid, AUTH_UID, AUTH_UID_LEN) == 0) {
+                return 1;                    /* 刷到授權卡 */
+            }
+            /* 非授權卡 → 忽略 */
+        }
+        usleep(200000);                      /* 每 0.2 秒掃一次 */
     }
 }

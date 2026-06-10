@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # 智慧倉庫即時可視化:立體紙箱(漸層光影)+ 橘子/紅十字 + 警報器
 import socket, re, tkinter as tk
+import sys
 
-HOST, PORT = "127.0.0.1", 9000
+HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+PORT = 9000
 ZONES = [("醫療用品", "med"), ("生鮮食品", "food"), ("一般貨物", "goods")]
 NAME_MAP = {"med": "醫療物資", "food": "生鮮食品", "goods": "一般貨物"}
 RED = "#d9352c"

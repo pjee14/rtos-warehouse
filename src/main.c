@@ -22,6 +22,9 @@
 #define PRIO_LOW    20
 #define INVENTORY_WORKERS 3
 
+static pthread_mutex_t lock_mtx = PTHREAD_MUTEX_INITIALIZER;
+static int system_locked = 1;   /* 1=鎖定, 0=解鎖,於 main 由 dev_starts_locked() 設定 */
+
 static volatile sig_atomic_t g_running = 1;
 static void on_sigint(int sig) { (void)sig; g_running = 0; }   /* handler 只設旗標 */
 
@@ -35,6 +38,7 @@ static pqueue_t        scan_q;
 static mempool_t       msg_pool;
 static int             inventory[ITEM_TYPE_COUNT] = {0};
 static int             reserved_out[ITEM_TYPE_COUNT] = {0};
+static int             last_cat_count = -1;   /* 最近異動分類的現有量(給第二顆七段),inv_lock 保護 */
 static pthread_mutex_t inv_lock;
 
 /* ===== Inventory → Alert 警報通道 ===== */
@@ -87,6 +91,22 @@ static int prep_seconds(item_type_t t) {
         case ITEM_GENERAL: return 8;   /* 一般 8 秒 */
         default:           return 1;
     }
+}
+
+/* Scanner:刷授權卡 → 切換系統鎖定 / 解鎖 */
+static void *scanner_task(void *arg) {
+    while (1) {
+        if (dev_wait_card()) {                 /* 阻塞等授權卡 */
+            pthread_mutex_lock(&lock_mtx);
+            system_locked = !system_locked;
+            int locked = system_locked;
+            pthread_mutex_unlock(&lock_mtx);
+            if (locked) printf("  [RFID] 刷卡:系統已鎖定,暫停進出貨\n");
+            else        printf("  [RFID] 刷卡:系統已解鎖,可開始進出貨\n");
+            sleep(5);                          /* 冷卻,避免一次刷卡被當多次 */
+        }
+    }
+    return NULL;
 }
 
 static void *inventory_task(void *arg) {
@@ -148,6 +168,7 @@ static void *inventory_task(void *arg) {
         }
         int now = inventory[m->type];
         int avail_now = inventory[m->type] - reserved_out[m->type];
+        last_cat_count = now;                  /* 記錄最近異動的分類數量(給第二顆七段) */
         pthread_mutex_unlock(&inv_lock);
 
         printf("  [員工%d] %s %s %d 完成 → 現有 %d,可用 %d\n",
@@ -165,7 +186,7 @@ static void *inventory_task(void *arg) {
     return NULL;
 }
 
-/* Display:庫存有變化才更新七段 */
+/* Display:最近異動分類數量有變化才更新雙七段(十位 + 個位) */
 static void *display_task(void *arg) {
     int last_cat = -1;
     while (1) {
@@ -289,7 +310,8 @@ static void *socket_task(void *arg) {
                     "  查詢: query\n"
                     "  進貨: in  med/food/goods 數量\n"
                     "  出貨: out med/food/goods 數量\n"
-                    "  離開: quit\n");
+                    "  離開: quit\n"
+                    "  (注意:進出貨前須由管理員刷卡解鎖)\n");
             } else {
                 char buf[128];
                 ssize_t n = read(fd, buf, sizeof(buf) - 1);
@@ -302,22 +324,30 @@ static void *socket_task(void *arg) {
                 if (k >= 1 && strcmp(cmd, "quit") == 0) {
                     close(fd); FD_CLR(fd, &master);
                 } else if (k >= 1 && (strcmp(cmd, "in") == 0 || strcmp(cmd, "out") == 0)) {
-                    item_type_t type; int ok = 1;
-                    if      (strcmp(item, "med")   == 0) type = ITEM_MEDICAL;
-                    else if (strcmp(item, "food")  == 0) type = ITEM_FRESH;
-                    else if (strcmp(item, "goods") == 0) type = ITEM_GENERAL;
-                    else ok = 0;
-                    if (k != 3 || amt <= 0 || !ok) {
-                        net_send(fd, "格式: in/out  med/food/goods  數量  (例: out med 3)\n");
+                    /* 先檢查系統是否已刷卡解鎖 */
+                    pthread_mutex_lock(&lock_mtx);
+                    int locked = system_locked;
+                    pthread_mutex_unlock(&lock_mtx);
+                    if (locked) {
+                        net_send(fd, "系統已鎖定,請先刷卡解鎖才能進出貨\n");
                     } else {
-                        scan_msg_t *m = mempool_alloc(&msg_pool);
-                        m->type     = type;
-                        m->action   = (cmd[0] == 'i') ? ACTION_IN : ACTION_OUT;
-                        m->amount   = amt;
-                        m->priority = ITEMS[type].priority;
-                        m->reply_fd = fd;                  /* 處理完回報這個 client */
-                        pq_push(&scan_q, m);               /* 依優先權排隊 */
-                        net_send(fd, "已收到,依貨物優先權排入佇列處理...\n");
+                        item_type_t type; int ok = 1;
+                        if      (strcmp(item, "med")   == 0) type = ITEM_MEDICAL;
+                        else if (strcmp(item, "food")  == 0) type = ITEM_FRESH;
+                        else if (strcmp(item, "goods") == 0) type = ITEM_GENERAL;
+                        else ok = 0;
+                        if (k != 3 || amt <= 0 || !ok) {
+                            net_send(fd, "格式: in/out  med/food/goods  數量  (例: out med 3)\n");
+                        } else {
+                            scan_msg_t *m = mempool_alloc(&msg_pool);
+                            m->type     = type;
+                            m->action   = (cmd[0] == 'i') ? ACTION_IN : ACTION_OUT;
+                            m->amount   = amt;
+                            m->priority = ITEMS[type].priority;
+                            m->reply_fd = fd;                  /* 處理完回報這個 client */
+                            pq_push(&scan_q, m);               /* 依優先權排隊 */
+                            net_send(fd, "已收到,依貨物優先權排入佇列處理...\n");
+                        }
                     }
                 } else {
                     char snap[512];
@@ -361,7 +391,7 @@ static void init_inventory_lock(void) {
 }
 
 int main(void) {
-    pthread_t inv_tid[INVENTORY_WORKERS], display, alert, sock, button;
+    pthread_t inv_tid[INVENTORY_WORKERS], display, alert, sock, button, scanner;
 
     pq_init(&scan_q);
     mempool_init(&msg_pool);
@@ -373,6 +403,8 @@ int main(void) {
         reserved_out[i] = 0;
     }
 
+    system_locked = dev_starts_locked();   /* 有讀卡機→鎖定(需刷卡);無讀卡機→解鎖 */
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_sigint;
@@ -383,11 +415,13 @@ int main(void) {
     printf("初始庫存:醫療 5、生鮮 5、一般 5\n");
     printf("備貨時間:醫療 3 秒、生鮮 5 秒、一般 8 秒\n");
     printf("同時作業員工:%d 人\n", INVENTORY_WORKERS);
+    printf("系統狀態:%s\n", system_locked ? "已鎖定(請刷卡解鎖才能進出貨)" : "已解鎖");
     printf("遠端連線:nc 127.0.0.1 9000  (query / in / out)\n");
     printf("按 Ctrl+C 結束\n\n");
 
-    if (create_rt_task(&alert,   alert_task,     PRIO_HIGH,   "Alert")      != 0) return 1;
-    if (create_rt_task(&button, button_task,    PRIO_HIGH,   "Button")     != 0) return 1;
+    if (create_rt_task(&alert,   alert_task,     PRIO_HIGH,   "Alert")     != 0) return 1;
+    if (create_rt_task(&button,  button_task,    PRIO_HIGH,   "Button")    != 0) return 1;
+    if (create_rt_task(&scanner, scanner_task,   PRIO_MEDIUM, "Scanner")   != 0) return 1;
     for (int i = 0; i < INVENTORY_WORKERS; i++) {
         char name[32];
         snprintf(name, sizeof(name), "Inventory-%d", i + 1);
@@ -409,4 +443,3 @@ int main(void) {
     printf("=== 系統已關閉 ===\n");
     return 0;
 }
-
