@@ -36,7 +36,6 @@ static mempool_t       msg_pool;
 static int             inventory[ITEM_TYPE_COUNT] = {0};
 static int             reserved_out[ITEM_TYPE_COUNT] = {0};
 static pthread_mutex_t inv_lock;
-static int             last_cat_count = -1;
 
 /* ===== Inventory → Alert 警報通道 ===== */
 #define ALERT_CAP 16
@@ -149,7 +148,6 @@ static void *inventory_task(void *arg) {
         }
         int now = inventory[m->type];
         int avail_now = inventory[m->type] - reserved_out[m->type];
-        last_cat_count = now;
         pthread_mutex_unlock(&inv_lock);
 
         printf("  [員工%d] %s %s %d 完成 → 現有 %d,可用 %d\n",
