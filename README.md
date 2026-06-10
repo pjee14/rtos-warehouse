@@ -1,99 +1,153 @@
-# 智慧倉庫管理系統 (RTOS-based Smart Warehouse)
+# 智慧倉庫系統(RTOS Smart Warehouse)
 
-基於嵌入式 Linux 的即時智慧倉庫系統:用 pthread 實作多任務、SCHED_FIFO 即時優先權排程、
-訊息佇列 / Mutex / 計數號誌三種 IPC、固定區塊記憶體池,以及並發 TCP socket server。
+以 **C + POSIX threads(`SCHED_FIFO` 即時排程)** 實作的多工即時倉儲管理系統。在 Ubuntu VM 上開發,並部署到 Raspberry Pi 4 連接真實硬體(LED、蜂鳴器、按鈕、雙七段顯示器、PN532 RFID)。本專案為 NYCU 嵌入式 / RTOS 課程期末專題。
 
-> 目前為**筆電模擬版**:七段顯示器 / LED / 蜂鳴器以 terminal 文字模擬,Scanner 自動隨機模擬進出貨。
-> 樹莓派實體 GPIO 為後續工作(只需替換裝置層,上層程式不動)。
+## 組員
 
-## 系統架構
+洪珮珈、李澤言、林彥兆
 
-5 條 task(pthread)以即時優先權並行運作,資料流如下:
+## 系統概念
 
-    [Scanner]  自動隨機進出貨,從記憶體池取訊息,丟進優先序佇列
-        |
-        v   (優先序訊息佇列 scan_q,依貨物優先序排序)
-    [Inventory]  取訊息 → 更新庫存表(mutex+優先權繼承) → 判斷門檻
-        |
-        |-- 低於門檻 --(計數號誌 alert_sem)--> [Alert] 亮 LED / 鳴蜂鳴器
-        |
-      庫存表 inventory[]
-        ^                       ^
-        | (讀,上鎖)             | (讀,上鎖)
-    [Display] 顯示到七段     [Socket] <==TCP / select== 遠端 client 查詢
+模擬一個多人同時操作的智慧倉庫:多個遠端使用者透過網路同時進貨 / 出貨,系統以多個即時任務(task)平行處理、依貨物優先權排程、保護共享庫存不被超賣,並透過實體裝置(七段顯示、警報燈、蜂鳴器、按鈕、RFID)與外界互動。
 
-## 環境需求
+## 架構:任務(Task)與優先權
 
-- Linux(Ubuntu / Debian / WSL / 虛擬機),**不支援原生 Windows 或 macOS**
-- gcc、make、python3-tk(可視化用)
-- 執行需 root 權限(SCHED_FIFO 即時優先權)
+採用 pthreads + `SCHED_FIFO`,將系統拆解為以下並行任務:
+
+| 任務 | 優先權 | 職責 |
+|------|--------|------|
+| Alert | 高 (80) | 庫存低於門檻 / 出貨被拒時觸發警報,點亮 LED + 蜂鳴器,**持續到管理員按鈕解除** |
+| Button | 高 (80) | 等待實體按鈕(GPIO),按下即解除警報(非同步事件 / 中斷處理) |
+| Inventory ×3 | 中 (50) | 三個平行作業員,處理進出貨;備貨時間在鎖外執行,達成真正平行 |
+| Socket | 中 (50) | 多人 TCP 伺服器(port 9000),`select()` 同時服務多個 client |
+| Display | 低 (20) | 驅動雙七段顯示器,顯示最近一筆異動分類的數量(十位 + 個位) |
+
+## 平行處理與並發安全
+
+- **三個 Inventory worker 平行備貨**:耗時的備貨動作在鎖外執行,三筆訂單(3 + 5 + 8 秒)單一 worker 需 16 秒,三個平行最慢只要 8 秒。
+- **保留機制(`reserved_out`)防止超賣**:出貨在鎖內原子地「檢查 + 保留」,避免多個 worker 同時通過檢查導致庫存變負。
+- **兩層優先權排程**:任務優先權由 `SCHED_FIFO` 管理;貨物優先權由優先佇列管理(醫療 > 生鮮 > 一般;同品項時,數量較接近現有庫存者先處理)。
+
+## IPC 與同步機制(OS 核心服務)
+
+- 優先權訊息佇列(`scan_q`)
+- 優先權繼承互斥鎖(`PTHREAD_PRIO_INHERIT`)保護庫存表,防止優先權反轉
+- 條件變數(佇列與警報通道的喚醒)
+- 計數號誌(固定區塊記憶體池,取代 `malloc`,O(1) 配置、無碎片)
+- 信號(`SIGINT` 優雅關機、忽略 `SIGPIPE`)
+
+## 貨物分級
+
+| 品項 | 指令字 | 優先權 | 安全門檻 | 備貨時間 | 初始庫存 |
+|------|--------|--------|----------|----------|----------|
+| 醫療物資 | `med` | 3 | 3 | 3 秒 | 5 |
+| 生鮮食品 | `food` | 2 | 3 | 5 秒 | 5 |
+| 一般貨物 | `goods` | 1 | 3 | 8 秒 | 5 |
+
+## 裝置抽象層(device.h)
+
+上層任務不直接碰硬體,一律透過統一介面操作:
+`dev_init()`、`dev_set_led()`、`dev_set_buzzer()`、`dev_show_number()`、`dev_wait_button()`。
+
+- **`device_virtual.c`**:終端機模擬(VM 開發用,無硬體)
+- **`device_gpio.c`**:真實 GPIO(Raspberry Pi,透過 sysfs)
+
+同一份上層程式碼,只要在編譯時切換裝置實作即可,不必更動任何任務。
+
+## 硬體接線(Raspberry Pi 4,BCM 編號)
+
+| 功能 | GPIO | 實體 pin |
+|------|------|---------|
+| LED(警報燈) | 17 | 11 |
+| 蜂鳴器 | 27 | 13 |
+| 按鈕(解除警報) | 4 | 7 |
+| 七段 #1 個位 a~g | 5, 6, 13, 19, 26, 12, 16 | 29, 31, 33, 35, 37, 32, 36 |
+| 七段 #2 十位 a~g | 22, 23, 24, 25, 8, 7, 18 | 15, 16, 18, 22, 24, 26, 12 |
+| PN532 RFID(UART,進行中) | 14 (TX), 15 (RX) | 8, 10 |
+
+接線注意:
+- 每個 LED / 七段段位串接 220–330Ω 限流電阻。
+- 按鈕需外接 10kΩ 上拉電阻到 3.3V(平常讀 1、按下接地讀 0)。
+- 兩顆七段的共用腳依共陰 / 共陽分別接 GND / 3.3V。
+- PN532 以 5V 供電(3.3V 供電不足會隨機重置),走 HSU/UART 模式,TX ↔ RX 交叉。
 
 ## 編譯與執行
 
-    make
-    sudo ./warehouse
+需 root 權限(`SCHED_FIFO` 即時優先權 + GPIO 存取)。
 
-系統會自動隨機模擬進出貨。按 Ctrl+C 可關閉(印出最終庫存後安全離開)。
+VM(終端機模擬):
 
-## 遠端查詢測試
+```bash
+make
+sudo ./warehouse
+```
 
-另開一個終端機:
+Raspberry Pi(真實硬體):
 
-    nc 127.0.0.1 9000
+```bash
+make DEVICE=gpio
+sudo ./warehouse
+```
 
-連上後輸入任意字查即時庫存,輸入 quit 離開。可同時開多個 client。
+遠端 client 連線:
 
-## 即時可視化
+```bash
+nc <伺服器IP> 9000
+```
 
-圖形化前端會連到 socket(port 9000),把倉庫畫成立體紙箱堆疊(醫療紅十字、生鮮橘子、一般素面)並即時更新,庫存不足時警報器亮起。
+可用指令:
 
-    sudo apt install python3-tk      # 第一次需安裝
-    python3 tools/warehouse_view.py  # C 系統執行中時另開
+- `query` — 查詢各分類庫存
+- `in med/food/goods 數量` — 進貨
+- `out med/food/goods 數量` — 出貨
+- `quit` — 離開連線
 
-## 系統行為
+## 即時視覺化
 
-- 三種貨物:醫療物資 / 生鮮食品 / 一般貨物,**安全門檻皆為 3,初始庫存皆為 5**。
-- 進貨累加、出貨扣減。
-- 出貨後低於門檻 → 觸發警報。
-- 出貨量超過現有庫存 → **拒絕出貨並警報**(庫存不變)。
-- 貨物優先序(醫療 > 生鮮 > 一般)決定佇列中先被處理的順序。
+```bash
+sudo apt install python3-tk
+python3 tools/warehouse_view.py
+```
 
-## 五個 Task
-
-| Task | 優先權 | 職責 |
-|------|--------|------|
-| Scanner | High (80) | 自動隨機模擬進出貨,封裝訊息丟進佇列 |
-| Alert | High (80) | 收到庫存不足通知 → 控制 LED / 蜂鳴器 |
-| Inventory | Medium (50) | 取訊息、更新庫存、判斷門檻、拒絕超量出貨 |
-| Socket | Medium (50) | TCP server,接受遠端 client 查詢 |
-| Display | Low (20) | 顯示庫存總數到七段顯示器 |
-
-## 三種 IPC
-
-| 機制 | 程式變數 | 用途 |
-|------|---------|------|
-| 訊息佇列 | scan_q | Scanner → Inventory 非同步傳資料,依貨物優先序排序 |
-| Mutex(優先權繼承) | inv_lock | 保護庫存表防 race condition;PRIO_INHERIT 防優先權反轉 |
-| 計數號誌 | alert_sem | Inventory 通知 Alert 警報事件;記憶體池也用號誌管理空閒區塊 |
+以 tkinter 連到 port 9000,每秒查詢庫存並繪製倉庫場景(立體紙箱、分類圖示、警報燈)。本質上就是另一個 socket client。
 
 ## 檔案結構
 
-| 檔案 | 說明 |
-|------|------|
-| src/main.c | 5 個 task、優先權設定、警報通道、socket server、signal handler、main 流程 |
-| src/message.h | 訊息結構、貨物種類/動作列舉、貨物屬性(priority、threshold) |
-| src/pqueue.h / .c | 優先序訊息佇列(mutex + condition variable,空則阻塞) |
-| src/mempool.h / .c | 固定區塊記憶體池(counting semaphore + mutex,O(1) 配置) |
-| src/device.h | 裝置抽象介面(七段 / LED / 蜂鳴器) |
-| src/device_virtual.c | 裝置介面的虛擬實作;Pi 上替換為 device_gpio.c |
-| tools/warehouse_view.py | Python 即時可視化前端(連 socket,畫倉庫紙箱與警報器) |
-| Makefile | 編譯設定 |
+```
+warehouse/
+├── src/
+│   ├── main.c            # 任務、優先權、警報、按鈕、Socket、主程式
+│   ├── message.h         # 訊息結構與品項型別
+│   ├── pqueue.c / .h     # 優先權佇列
+│   ├── mempool.c / .h    # 固定區塊記憶體池
+│   ├── device.h          # 裝置抽象介面
+│   ├── device_virtual.c  # 終端機模擬(VM)
+│   └── device_gpio.c     # 真實 GPIO(Pi,sysfs)
+├── tools/
+│   └── warehouse_view.py # tkinter 即時視覺化
+├── Makefile              # make / make DEVICE=gpio 切換虛擬與實體
+└── README.md
+```
 
-## 詳細文件
+## Demo 情境
 
-架構說明、簡報對應、Demo 腳本,詳見 docs/ 資料夾。
+1. **平行處理**:三個 client 幾乎同時送 `out goods/food/med 1`,觀察三個員工同時備貨、依秒數先後完成。
+2. **優先權排程**:先讓三個員工忙碌,再丟入混合優先序的訂單,觀察醫療物資被優先挑出。
+3. **並發安全**:三個 client 同時對同品項超額出貨,1 筆成功、其餘被拒,並觸發警報。
+4. **警報與人為介入**:出貨使庫存低於門檻 → LED + 蜂鳴器持續警示 → 管理員按下按鈕解除。
+5. **即時查詢**:任一 client 隨時 `query`,展示 Socket 任務獨立運作。
 
-## 後續工作(樹莓派)
+## 對應課程內容
 
-1. 撰寫 device_gpio.c,實作 device.h 同樣四個函式但操作真實 GPIO,Makefile 替換重編。
-2. 按鈕用 kernel driver 的 request_irq 接中斷 + workqueue 做下半部,取代 Scanner 的亂數模擬。
+- **多工 / 任務拆分**:五類任務各司其職、各自阻塞於不同事件而平行運作
+- **排程與優先權**:`SCHED_FIFO` 兩層優先權
+- **IPC**:訊息佇列、互斥鎖、條件變數、號誌
+- **中斷 / 非同步事件**:GPIO 按鈕觸發警報解除
+- **裝置 I/O**:GPIO 控制 LED / 蜂鳴器 / 雙七段;PN532 RFID 掃描(進行中)
+- **Socket 與記憶體管理**:TCP 多人連線、固定區塊記憶體池
+
+## 開發環境
+
+- Ubuntu 22.04(VirtualBox VM)、gcc、pthreads
+- Raspberry Pi 4、Raspberry Pi OS、sysfs GPIO、libnfc(RFID)
+- Python 3 + tkinter(視覺化)
