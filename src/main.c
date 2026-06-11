@@ -16,6 +16,7 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <time.h>
+#include <sys/time.h>
 
 #define PRIO_HIGH   80
 #define PRIO_MEDIUM 50
@@ -34,12 +35,33 @@ static const item_info_t ITEMS[ITEM_TYPE_COUNT] = {
     { "一般貨物", 1, 3 },
 };
 
+/* 給視覺化/狀態回報用的英文代碼,順序需對應 item_type_t */
+static const char *ICODE[ITEM_TYPE_COUNT] = { "med", "food", "goods" };
+
+/* 微秒級時間(秒,double),用來算員工備貨剩餘時間 */
+static double now_sec(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + tv.tv_usec / 1e6;
+}
+
 static pqueue_t        scan_q;
 static mempool_t       msg_pool;
 static int             inventory[ITEM_TYPE_COUNT] = {0};
 static int             reserved_out[ITEM_TYPE_COUNT] = {0};
 static int             last_cat_count = -1;   /* 最近異動分類的現有量(給第二顆七段),inv_lock 保護 */
 static pthread_mutex_t inv_lock;
+
+/* ===== 員工備貨狀態(給 status 回報、視覺化用) ===== */
+typedef struct {
+    int         busy;     /* 0=待命, 1=備貨中 */
+    item_type_t type;     /* 正在處理的貨物 */
+    action_t    action;   /* 進貨/出貨 */
+    double      start;    /* 開始備貨的時間(now_sec) */
+    int         prep;     /* 這次備貨總秒數 */
+} wstate_t;
+static wstate_t        wstate[INVENTORY_WORKERS];
+static pthread_mutex_t wstate_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ===== Inventory → Alert 警報通道 ===== */
 #define ALERT_CAP 16
@@ -111,6 +133,7 @@ static void *scanner_task(void *arg) {
 
 static void *inventory_task(void *arg) {
     int worker_id = (int)(intptr_t)arg;
+    int idx = worker_id - 1;                   /* wstate 陣列索引 */
     while (1) {
         int available[ITEM_TYPE_COUNT];
         pthread_mutex_lock(&inv_lock);
@@ -157,7 +180,22 @@ static void *inventory_task(void *arg) {
                      worker_id, nm, action_name(m->action), m->amount, secs);
             net_send(m->reply_fd, reply);
         }
+
+        /* 標記此員工為備貨中(給 status / 視覺化) */
+        pthread_mutex_lock(&wstate_lock);
+        wstate[idx].busy   = 1;
+        wstate[idx].type   = m->type;
+        wstate[idx].action = m->action;
+        wstate[idx].start  = now_sec();
+        wstate[idx].prep   = secs;
+        pthread_mutex_unlock(&wstate_lock);
+
         sleep(secs);
+
+        /* 備貨完成 → 標記為待命 */
+        pthread_mutex_lock(&wstate_lock);
+        wstate[idx].busy = 0;
+        pthread_mutex_unlock(&wstate_lock);
 
         /* 3) 備貨完成 → 鎖內提交庫存變動 */
         pthread_mutex_lock(&inv_lock);
@@ -274,6 +312,44 @@ static void inventory_snapshot_str(char *out, size_t n) {
         snap[ITEM_GENERAL], reserved[ITEM_GENERAL], snap[ITEM_GENERAL] - reserved[ITEM_GENERAL], ITEMS[ITEM_GENERAL].threshold);
 }
 
+/* status:給視覺化用的機器可讀狀態
+ *   LOCK <0|1>
+ *   ITEM <code> <現有> <門檻> <保留出貨>      (三種貨物各一行)
+ *   WORKER <id> busy <code> <in|out> <剩餘秒> <總秒>   或
+ *   WORKER <id> idle - - 0 0                  (三位員工各一行)
+ */
+static void status_str(char *out, size_t n) {
+    pthread_mutex_lock(&lock_mtx);
+    int locked = system_locked;
+    pthread_mutex_unlock(&lock_mtx);
+
+    int snap[ITEM_TYPE_COUNT], resv[ITEM_TYPE_COUNT];
+    pthread_mutex_lock(&inv_lock);
+    for (int i = 0; i < ITEM_TYPE_COUNT; i++) { snap[i] = inventory[i]; resv[i] = reserved_out[i]; }
+    pthread_mutex_unlock(&inv_lock);
+
+    int off = snprintf(out, n, "LOCK %d\n", locked);
+    for (int i = 0; i < ITEM_TYPE_COUNT && off < (int)n; i++)
+        off += snprintf(out + off, n - off, "ITEM %s %d %d %d\n",
+                        ICODE[i], snap[i], ITEMS[i].threshold, resv[i]);
+
+    double t = now_sec();
+    pthread_mutex_lock(&wstate_lock);
+    for (int i = 0; i < INVENTORY_WORKERS && off < (int)n; i++) {
+        if (wstate[i].busy) {
+            double rem = wstate[i].prep - (t - wstate[i].start);
+            if (rem < 0) rem = 0;
+            off += snprintf(out + off, n - off, "WORKER %d busy %s %s %.1f %d\n",
+                            i + 1, ICODE[wstate[i].type],
+                            wstate[i].action == ACTION_IN ? "in" : "out",
+                            rem, wstate[i].prep);
+        } else {
+            off += snprintf(out + off, n - off, "WORKER %d idle - - 0 0\n", i + 1);
+        }
+    }
+    pthread_mutex_unlock(&wstate_lock);
+}
+
 static void *socket_task(void *arg) {
     int listenfd = socket(AF_INET, SOCK_STREAM, 0);
     if (listenfd < 0) { perror("socket"); return NULL; }
@@ -308,6 +384,7 @@ static void *socket_task(void *arg) {
                 net_send(connfd,
                     "=== 智慧倉庫連線成功 ===\n"
                     "  查詢: query\n"
+                    "  狀態: status (給視覺化用)\n"
                     "  進貨: in  med/food/goods 數量\n"
                     "  出貨: out med/food/goods 數量\n"
                     "  離開: quit\n"
@@ -323,6 +400,10 @@ static void *socket_task(void *arg) {
 
                 if (k >= 1 && strcmp(cmd, "quit") == 0) {
                     close(fd); FD_CLR(fd, &master);
+                } else if (k >= 1 && strcmp(cmd, "status") == 0) {
+                    char st[512];
+                    status_str(st, sizeof(st));
+                    net_send(fd, st);
                 } else if (k >= 1 && (strcmp(cmd, "in") == 0 || strcmp(cmd, "out") == 0)) {
                     /* 先檢查系統是否已刷卡解鎖 */
                     pthread_mutex_lock(&lock_mtx);
@@ -402,6 +483,7 @@ int main(void) {
         inventory[i] = 5;   /* 初始庫存皆 5 */
         reserved_out[i] = 0;
     }
+    for (int i = 0; i < INVENTORY_WORKERS; i++) wstate[i].busy = 0;
 
     system_locked = dev_starts_locked();   /* 有讀卡機→鎖定(需刷卡);無讀卡機→解鎖 */
 
@@ -416,7 +498,7 @@ int main(void) {
     printf("備貨時間:醫療 3 秒、生鮮 5 秒、一般 8 秒\n");
     printf("同時作業員工:%d 人\n", INVENTORY_WORKERS);
     printf("系統狀態:%s\n", system_locked ? "已鎖定(請刷卡解鎖才能進出貨)" : "已解鎖");
-    printf("遠端連線:nc 127.0.0.1 9000  (query / in / out)\n");
+    printf("遠端連線:nc 127.0.0.1 9000  (query / in / out / status)\n");
     printf("按 Ctrl+C 結束\n\n");
 
     if (create_rt_task(&alert,   alert_task,     PRIO_HIGH,   "Alert")     != 0) return 1;
