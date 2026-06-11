@@ -9,6 +9,6 @@ void dev_set_led(int on);          /* 警報 LED:1=亮 0=滅 */
 void dev_set_buzzer(int on);       /* 蜂鳴器:1=響 0=停 */
 void dev_wait_button(void);   /* 阻塞直到按鈕被按下 */
 void dev_show_number2(int n);   /* 第二顆七段:顯示最近異動分類的數量 */
-int  dev_wait_card(void);      /* 阻塞直到刷到授權卡,回傳 1 */
-int  dev_starts_locked(void);  /* 系統初始是否鎖定 */
+int dev_card_count(void);       /* 可用讀卡機數量(0/1) */
+int dev_wait_card(int reader);  /* 阻塞直到 reader 偵測到卡,回傳1;該 reader 不存在則睡一下回 0 */
 #endif

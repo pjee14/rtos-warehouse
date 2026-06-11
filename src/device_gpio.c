@@ -1,103 +1,94 @@
-/* device_gpio.c — 真實 GPIO (Raspberry Pi, 透過 sysfs,無需任何函式庫) */
-#include "device.h"
+/* device_gpio.c — Raspberry Pi 實體版(sysfs GPIO + PN532 libnfc)
+ * 介面對應 device.h:
+ *   dev_init, dev_set_led, dev_set_buzzer, dev_show_number,
+ *   dev_wait_button, dev_card_count, dev_wait_card(reader)
+ */
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
-#include <poll.h>
-#include <fcntl.h>
-#include <nfc/nfc.h>
 #include <string.h>
 #include <stdint.h>
+#include <nfc/nfc.h>
+#include "device.h"
 
-static nfc_device  *nfc_dev = NULL;
-static nfc_context *nfc_ctx = NULL;
+/* ===== 腳位(BCM) ===== */
+#define LED_PIN    17
+#define BUZZER_PIN 27
+#define BUTTON_PIN 4
 
-/* 你的授權卡 UID:92 68 c9 05 */
-static const uint8_t AUTH_UID[]   = {0x92, 0x68, 0xC9, 0x05};
-static const size_t  AUTH_UID_LEN = 4;
+/* 七段#1(個位)a–g */
+static const int seg_pins[7]  = { 5, 6, 13, 19, 26, 12, 16 };
+/* 七段#2(十位)a–g:25→21、8→20,把 SPI 的 CE0/RST 讓給 RC522 */
+static const int seg2_pins[7] = { 22, 23, 24, 21, 20, 7, 18 };
 
-/* ---- GPIO 腳位 (BCM 編號) ---- */
-#define LED_PIN     17
-#define BUZZER_PIN  27
-static const int seg_pins[7] = {5, 6, 13, 19, 26, 12, 16};  /* a,b,c,d,e,f,g */
-#define DP_PIN      20      /* 小數點(選配):總數 >=10 時點亮當「十位以上」指示 */
-static const int seg2_pins[7] = {22, 23, 24, 25, 8, 7, 18};  /* 第二顆 a,b,c,d,e,f,g */
-#define DP2_PIN 21
-
-/* 共陰極:1=亮。若你的七段是共陽極,把這兩個對調即可 */
+/* 共陰七段:段亮 = 輸出 1 */
 #define SEG_ON  1
 #define SEG_OFF 0
-
-#define BUTTON_PIN 4          /* 實體 pin 7 */
-static int btn_fd = -1;
-
-static void gpio_dir_in(int pin) {
-    char p[64]; snprintf(p, sizeof(p), "/sys/class/gpio/gpio%d/direction", pin);
-    FILE *f = fopen(p, "w"); if (f) { fprintf(f, "in"); fclose(f); }
-}
-static void gpio_edge(int pin, const char *e) {
-    char p[64]; snprintf(p, sizeof(p), "/sys/class/gpio/gpio%d/edge", pin);
-    FILE *f = fopen(p, "w"); if (f) { fprintf(f, "%s", e); fclose(f); }
-}
-
-void dev_wait_button(void) {
-    if (btn_fd < 0) { sleep(1); return; }
-    char buf[8];
-    struct pollfd pfd = { .fd = btn_fd, .events = POLLPRI | POLLERR };
-    lseek(btn_fd, 0, SEEK_SET); if (read(btn_fd, buf, sizeof(buf)) < 0) {}
-    poll(&pfd, 1, -1);                 /* 阻塞等下降緣 → 等同中斷 */
-    lseek(btn_fd, 0, SEEK_SET); if (read(btn_fd, buf, sizeof(buf)) < 0) {}
-    usleep(30000);                     /* 去彈跳 */
-}
-
-static const int seg_code[10][7] = {   /* 沿用你 HW1 的 7 段碼 */
-    {1,1,1,1,1,1,0}, {0,1,1,0,0,0,0}, {1,1,0,1,1,0,1}, {1,1,1,1,0,0,1}, {0,1,1,0,0,1,1},
-    {1,0,1,1,0,1,1}, {1,0,1,1,1,1,1}, {1,1,1,0,0,0,0}, {1,1,1,1,1,1,1}, {1,1,1,1,0,1,1}
+static const int seg_code[10][7] = {
+    {1,1,1,1,1,1,0}, /* 0 */
+    {0,1,1,0,0,0,0}, /* 1 */
+    {1,1,0,1,1,0,1}, /* 2 */
+    {1,1,1,1,0,0,1}, /* 3 */
+    {0,1,1,0,0,1,1}, /* 4 */
+    {1,0,1,1,0,1,1}, /* 5 */
+    {1,0,1,1,1,1,1}, /* 6 */
+    {1,1,1,0,0,0,0}, /* 7 */
+    {1,1,1,1,1,1,1}, /* 8 */
+    {1,1,1,1,0,1,1}, /* 9 */
 };
 
+/* ===== sysfs GPIO 小工具(fopen/fprintf,免外部函式庫) ===== */
 static void gpio_export(int pin) {
     FILE *f = fopen("/sys/class/gpio/export", "w");
     if (f) { fprintf(f, "%d", pin); fclose(f); }
+    usleep(100000);                       /* 等 udev 建好節點 */
 }
-static void gpio_dir_out(int pin) {
+static void gpio_dir(int pin, const char *dir) {
     char p[64]; snprintf(p, sizeof(p), "/sys/class/gpio/gpio%d/direction", pin);
-    FILE *f = fopen(p, "w"); if (f) { fprintf(f, "out"); fclose(f); }
+    FILE *f = fopen(p, "w");
+    if (f) { fprintf(f, "%s", dir); fclose(f); }
 }
 static void gpio_write(int pin, int v) {
     char p[64]; snprintf(p, sizeof(p), "/sys/class/gpio/gpio%d/value", pin);
-    FILE *f = fopen(p, "w"); if (f) { fprintf(f, "%d", v); fclose(f); }
+    FILE *f = fopen(p, "w");
+    if (f) { fprintf(f, "%d", v ? 1 : 0); fclose(f); }
+}
+static int gpio_read(int pin) {
+    char p[64]; snprintf(p, sizeof(p), "/sys/class/gpio/gpio%d/value", pin);
+    FILE *f = fopen(p, "r");
+    if (!f) return 1;
+    int v = 1; if (fscanf(f, "%d", &v) != 1) v = 1;
+    fclose(f);
+    return v;
 }
 
+/* ===== PN532(libnfc,只有一台 → reader0 = 員工1) ===== */
+static nfc_context *nfc_ctx    = NULL;
+static nfc_device  *nfc_dev[1] = { NULL };
+static int          nfc_n      = 0;
 void dev_init(void) {
-    gpio_export(LED_PIN); gpio_export(BUZZER_PIN); gpio_export(DP_PIN);
-    for (int i = 0; i < 7; i++) gpio_export(seg_pins[i]);
-    gpio_export(DP2_PIN);
-    for (int i = 0; i < 7; i++) gpio_export(seg2_pins[i]);
-    usleep(200000);     /* 等 sysfs 建立檔案 */
-        gpio_dir_out(DP2_PIN);
-    for (int i = 0; i < 7; i++) gpio_dir_out(seg2_pins[i]);
-    gpio_write(DP2_PIN, 0);
-    for (int i = 0; i < 7; i++) gpio_write(seg2_pins[i], SEG_OFF);
-    gpio_dir_out(LED_PIN); gpio_dir_out(BUZZER_PIN); gpio_dir_out(DP_PIN);
-    for (int i = 0; i < 7; i++) gpio_dir_out(seg_pins[i]);
-    gpio_write(LED_PIN, 0); gpio_write(BUZZER_PIN, 0); gpio_write(DP_PIN, 0);
-    for (int i = 0; i < 7; i++) gpio_write(seg_pins[i], SEG_OFF);
-    gpio_export(BUTTON_PIN);
-    usleep(200000);
-    gpio_dir_in(BUTTON_PIN);
-    gpio_edge(BUTTON_PIN, "falling");  /* 按下接地 → 下降緣 */
-    {
-        char vp[64]; snprintf(vp, sizeof(vp), "/sys/class/gpio/gpio%d/value", BUTTON_PIN);
-        btn_fd = open(vp, O_RDONLY);
-    }
-    printf("[GPIO] sysfs 初始化完成\n");
+    /* LED / 蜂鳴器 / 按鈕 */
+    gpio_export(LED_PIN);    gpio_dir(LED_PIN,    "out"); gpio_write(LED_PIN,    0);
+    gpio_export(BUZZER_PIN); gpio_dir(BUZZER_PIN, "out"); gpio_write(BUZZER_PIN, 0);
+    gpio_export(BUTTON_PIN); gpio_dir(BUTTON_PIN, "in");
+
+    /* 雙七段 */
+    for (int i = 0; i < 7; i++) { gpio_export(seg_pins[i]);  gpio_dir(seg_pins[i],  "out"); gpio_write(seg_pins[i],  SEG_OFF); }
+    for (int i = 0; i < 7; i++) { gpio_export(seg2_pins[i]); gpio_dir(seg2_pins[i], "out"); gpio_write(seg2_pins[i], SEG_OFF); }
+
+    /* PN532 */
     nfc_init(&nfc_ctx);
+    nfc_n = 0;
     if (nfc_ctx) {
-        nfc_dev = nfc_open(nfc_ctx, NULL);    /* 用 /etc/nfc/libnfc.conf 設定的裝置 */
-        if (nfc_dev) {
-            nfc_initiator_init(nfc_dev);
-            printf("[NFC] PN532 就緒\n");
+        nfc_connstring cs;
+        snprintf(cs, sizeof(cs), "pn532_uart:/dev/serial0");
+        nfc_device *d = nfc_open(nfc_ctx, cs);
+        if (d && nfc_initiator_init(d) >= 0) {
+            nfc_dev[0] = d; nfc_n = 1;
+            printf("[NFC] PN532 就緒 (%s)\n", cs);
         } else {
-            fprintf(stderr, "[NFC] 開啟 PN532 失敗(將以解鎖狀態啟動)\n");
+            if (d) nfc_close(d);
+            printf("[NFC] 找不到 PN532(員工1 可用 punch 1 模擬)\n");
         }
     }
 }
@@ -105,40 +96,42 @@ void dev_init(void) {
 void dev_set_led(int on)    { gpio_write(LED_PIN,    on ? 1 : 0); }
 void dev_set_buzzer(int on) { gpio_write(BUZZER_PIN, on ? 1 : 0); }
 
+/* 顯示 0–99:個位在七段#1,十位在七段#2(十位為 0 則熄滅) */
 void dev_show_number(int n) {
-    printf("[七段] 最近異動分類數量 %d(十位+個位)\n", n);
     if (n < 0)  n = 0;
-    if (n > 99) n = 99;                 /* 兩顆只能到兩位數 */
-    int tens  = n / 10;
-    int units = n % 10;
+    if (n > 99) n = 99;
+    int units = n % 10, tens = n / 10;
+    for (int i = 0; i < 7; i++) gpio_write(seg_pins[i],  seg_code[units][i] ? SEG_ON : SEG_OFF);
+    if (tens == 0)
+        for (int i = 0; i < 7; i++) gpio_write(seg2_pins[i], SEG_OFF);          /* 前導零熄滅 */
+    else
+        for (int i = 0; i < 7; i++) gpio_write(seg2_pins[i], seg_code[tens][i] ? SEG_ON : SEG_OFF);
+}
 
-    /* 第一顆 = 個位 */
-    for (int i = 0; i < 7; i++)
-        gpio_write(seg_pins[i],  seg_code[units][i] ? SEG_ON : SEG_OFF);
-
-    /* 第二顆 = 十位(十位是 0 就不顯示,消除前導零,例如 5 顯示「 5」而非「05」) */
-    for (int i = 0; i < 7; i++) {
-        int on = (tens > 0) && seg_code[tens][i];
-        gpio_write(seg2_pins[i], on ? SEG_ON : SEG_OFF);
+/* 按鈕:上拉,平時讀 1,按下為 0;偵測 1→0 並 30ms 去彈跳 */
+void dev_wait_button(void) {
+    int prev = 1;
+    while (1) {
+        int v = gpio_read(BUTTON_PIN);
+        if (prev == 1 && v == 0) {
+            usleep(30000);
+            if (gpio_read(BUTTON_PIN) == 0) return;   /* 確認真的按下 */
+        }
+        prev = v;
+        usleep(5000);
     }
 }
 
-int dev_starts_locked(void) {
-    return nfc_dev ? 1 : 0;   /* 有讀卡機才鎖定;沒讀卡機就解鎖,避免被鎖死 */
-}
+/* ===== 讀卡機 ===== */
+int dev_card_count(void) { return nfc_n; }
 
-int dev_wait_card(void) {
-    if (!nfc_dev) { sleep(1); return 0; }    /* 沒讀卡機 → 不誤觸發 */
+int dev_wait_card(int reader) {
+    if (reader != 0 || !nfc_dev[0]) { sleep(1); return 0; }   /* 只有 reader0 = PN532 */
     const nfc_modulation nm = { .nmt = NMT_ISO14443A, .nbr = NBR_106 };
     nfc_target nt;
     while (1) {
-        if (nfc_initiator_select_passive_target(nfc_dev, nm, NULL, 0, &nt) > 0) {
-            if (nt.nti.nai.szUidLen == AUTH_UID_LEN &&
-                memcmp(nt.nti.nai.abtUid, AUTH_UID, AUTH_UID_LEN) == 0) {
-                return 1;                    /* 刷到授權卡 */
-            }
-            /* 非授權卡 → 忽略 */
-        }
-        usleep(200000);                      /* 每 0.2 秒掃一次 */
+        if (nfc_initiator_select_passive_target(nfc_dev[0], nm, NULL, 0, &nt) > 0)
+            return 1;                       /* 偵測到任何卡 = 員工1 打卡 */
+        usleep(200000);
     }
 }

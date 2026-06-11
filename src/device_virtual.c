@@ -16,12 +16,8 @@ void dev_show_number(int value) { printf("  [七段] 庫存總數 %d\n", value);
 void dev_set_led(int on)    { (void)on; }
 void dev_set_buzzer(int on) { (void)on; }
 
-int dev_starts_locked(void) { return 0; }    /* VM 沒讀卡機,預設解鎖方便測試 */
-
-int dev_wait_card(void) {
-    for (;;) sleep(3600);                     /* VM 無讀卡機,永遠等待 */
-    return 0;
-}
+int dev_card_count(void) { return 0; }       /* VM 沒讀卡機,用 socket 的 punch 模擬 */
+int dev_wait_card(int reader) { (void)reader; for (;;) sleep(3600); return 0; }
 
 //void dev_init(void) {
 //    printf("[裝置] 虛擬裝置已就緒(七段/LED/蜂鳴器以文字模擬)\n");
