@@ -1,153 +1,302 @@
-# 智慧倉庫系統(RTOS Smart Warehouse)
+# 智慧倉庫即時管理系統
 
-以 **C + POSIX threads(`SCHED_FIFO` 即時排程)** 實作的多工即時倉儲管理系統。在 Ubuntu VM 上開發,並部署到 Raspberry Pi 4 連接真實硬體(LED、蜂鳴器、按鈕、雙七段顯示器、PN532 RFID)。本專案為 NYCU 嵌入式 / RTOS 課程期末專題。
+NYCU RTOS 期末專題 — Group 4
 
-## 組員
+> 一套跑在 Raspberry Pi 4 上的多執行緒即時倉庫管理系統，結合 RFID 打卡上下班、GPIO 硬體控制、TCP 多人連線、優先權排程與即時視覺化監控。
 
-洪珮珈、李澤言、林彥兆
+---
 
-## 系統概念
+## 系統概述
 
-模擬一個多人同時操作的智慧倉庫:多個遠端使用者透過網路同時進貨 / 出貨,系統以多個即時任務(task)平行處理、依貨物優先權排程、保護共享庫存不被超賣,並透過實體裝置(七段顯示、警報燈、蜂鳴器、按鈕、RFID)與外界互動。
+本系統模擬一座智慧倉庫的完整運作流程：
 
-## 架構:任務(Task)與優先權
+- **員工打卡上班**後系統才開始處理進出貨；無人上班則拒絕所有操作
+- **2 位員工**可同時上班，各自從優先權佇列中搶工作**平行處理**
+- 每種貨物有不同的**備貨時間**與**優先權**，佇列自動排序
+- 庫存低於門檻時觸發 **LED + 蜂鳴器警報**，需實體按鈕解除
+- 雙七段顯示器即時顯示最近異動的分類數量
+- 遠端 Client 透過 TCP 連線操作；VM 上的 Python 視覺化即時呈現倉庫狀態
 
-採用 pthreads + `SCHED_FIFO`,將系統拆解為以下並行任務:
+---
 
-| 任務 | 優先權 | 職責 |
-|------|--------|------|
-| Alert | 高 (80) | 庫存低於門檻 / 出貨被拒時觸發警報,點亮 LED + 蜂鳴器,**持續到管理員按鈕解除** |
-| Button | 高 (80) | 等待實體按鈕(GPIO),按下即解除警報(非同步事件 / 中斷處理) |
-| Inventory ×3 | 中 (50) | 三個平行作業員,處理進出貨;備貨時間在鎖外執行,達成真正平行 |
-| Socket | 中 (50) | 多人 TCP 伺服器(port 9000),`select()` 同時服務多個 client |
-| Display | 低 (20) | 驅動雙七段顯示器,顯示最近一筆異動分類的數量(十位 + 個位) |
+## 架構圖
 
-## 平行處理與並發安全
+```
+┌─────────────────────────────────────────────────────┐
+│                   Raspberry Pi 4                     │
+│                                                      │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐   │
+│  │ Scanner  │  │ Scanner  │  │   Socket Task    │   │
+│  │ (PN532)  │  │ (RC522)  │  │  select() 多工   │   │
+│  │ reader=0 │  │ punch 2  │  │  port 9000       │   │
+│  └────┬─────┘  └────┬─────┘  └────────┬─────────┘   │
+│       │              │                 │              │
+│       ▼              ▼                 ▼              │
+│  ┌─────────────────────────────────────────────┐     │
+│  │          worker_punch(i) 打卡閘門            │     │
+│  │   shift_lock + condition variable            │     │
+│  │   on_duty[] / clockin_sec[] / clockout_req[] │     │
+│  └──────────────┬──────────────┬────────────────┘     │
+│                 │              │                       │
+│          ┌──────▼──────┐ ┌────▼────────┐              │
+│          │ Inventory-1 │ │ Inventory-2 │              │
+│          │ (員工1)     │ │ (員工2)     │              │
+│          └──────┬──────┘ └──────┬──────┘              │
+│                 │               │                      │
+│          ┌──────▼───────────────▼──────┐               │
+│          │  Priority Queue (scan_q)    │               │
+│          │  inv_lock (PRIO_INHERIT)    │               │
+│          │  inventory[] + reserved[]   │               │
+│          └──────┬──────────────────────┘               │
+│                 │                                      │
+│     ┌───────────┼───────────┬────────────┐             │
+│     ▼           ▼           ▼            ▼             │
+│  ┌──────┐  ┌────────┐  ┌────────┐  ┌─────────┐       │
+│  │Alert │  │Display │  │Button  │  │GPIO     │       │
+│  │Task  │  │Task    │  │Task    │  │LED/Buzz │       │
+│  │HIGH  │  │LOW     │  │HIGH    │  │7-seg x2 │       │
+│  └──────┘  └────────┘  └────────┘  └─────────┘       │
+└─────────────────────────────────────────────────────┘
 
-- **三個 Inventory worker 平行備貨**:耗時的備貨動作在鎖外執行,三筆訂單(3 + 5 + 8 秒)單一 worker 需 16 秒,三個平行最慢只要 8 秒。
-- **保留機制(`reserved_out`)防止超賣**:出貨在鎖內原子地「檢查 + 保留」,避免多個 worker 同時通過檢查導致庫存變負。
-- **兩層優先權排程**:任務優先權由 `SCHED_FIFO` 管理;貨物優先權由優先佇列管理(醫療 > 生鮮 > 一般;同品項時,數量較接近現有庫存者先處理)。
-
-## IPC 與同步機制(OS 核心服務)
-
-- 優先權訊息佇列(`scan_q`)
-- 優先權繼承互斥鎖(`PTHREAD_PRIO_INHERIT`)保護庫存表,防止優先權反轉
-- 條件變數(佇列與警報通道的喚醒)
-- 計數號誌(固定區塊記憶體池,取代 `malloc`,O(1) 配置、無碎片)
-- 信號(`SIGINT` 優雅關機、忽略 `SIGPIPE`)
-
-## 貨物分級
-
-| 品項 | 指令字 | 優先權 | 安全門檻 | 備貨時間 | 初始庫存 |
-|------|--------|--------|----------|----------|----------|
-| 醫療物資 | `med` | 3 | 3 | 3 秒 | 5 |
-| 生鮮食品 | `food` | 2 | 3 | 5 秒 | 5 |
-| 一般貨物 | `goods` | 1 | 3 | 8 秒 | 5 |
-
-## 裝置抽象層(device.h)
-
-上層任務不直接碰硬體,一律透過統一介面操作:
-`dev_init()`、`dev_set_led()`、`dev_set_buzzer()`、`dev_show_number()`、`dev_wait_button()`。
-
-- **`device_virtual.c`**:終端機模擬(VM 開發用,無硬體)
-- **`device_gpio.c`**:真實 GPIO(Raspberry Pi,透過 sysfs)
-
-同一份上層程式碼,只要在編譯時切換裝置實作即可,不必更動任何任務。
-
-## 硬體接線(Raspberry Pi 4,BCM 編號)
-
-| 功能 | GPIO | 實體 pin |
-|------|------|---------|
-| LED(警報燈) | 17 | 11 |
-| 蜂鳴器 | 27 | 13 |
-| 按鈕(解除警報) | 4 | 7 |
-| 七段 #1 個位 a~g | 5, 6, 13, 19, 26, 12, 16 | 29, 31, 33, 35, 37, 32, 36 |
-| 七段 #2 十位 a~g | 22, 23, 24, 25, 8, 7, 18 | 15, 16, 18, 22, 24, 26, 12 |
-| PN532 RFID(UART,進行中) | 14 (TX), 15 (RX) | 8, 10 |
-
-接線注意:
-- 每個 LED / 七段段位串接 220–330Ω 限流電阻。
-- 按鈕需外接 10kΩ 上拉電阻到 3.3V(平常讀 1、按下接地讀 0)。
-- 兩顆七段的共用腳依共陰 / 共陽分別接 GND / 3.3V。
-- PN532 以 5V 供電(3.3V 供電不足會隨機重置),走 HSU/UART 模式,TX ↔ RX 交叉。
-
-## 編譯與執行
-
-需 root 權限(`SCHED_FIFO` 即時優先權 + GPIO 存取)。
-
-VM(終端機模擬):
-
-```bash
-make
-sudo ./warehouse
+         ┌──────────────────┐
+         │ VM (Ubuntu 22.04)│
+         │                  │
+         │  warehouse_view  │◄── TCP status 輪詢
+         │  (tkinter 視覺化) │
+         │                  │
+         │  nc / Client     │◄── TCP 操作
+         └──────────────────┘
 ```
 
-Raspberry Pi(真實硬體):
+---
 
-```bash
-make DEVICE=gpio
-sudo ./warehouse
-```
+## 任務表
 
-遠端 client 連線:
+| 任務 | 優先權 | 排程 | 功能 |
+|------|--------|------|------|
+| Alert | HIGH (80) | SCHED_FIFO | 接收警報事件 → 亮 LED + 響蜂鳴器 |
+| Button | HIGH (80) | SCHED_FIFO | 偵測 GPIO4 按鈕 → 解除警報 |
+| Scanner-0 | MEDIUM (50) | SCHED_FIFO | PN532 偵測刷卡 → 員工1 打卡 |
+| Inventory-1 | MEDIUM (50) | SCHED_FIFO | 員工1 從佇列取工作 → 備貨 → 提交 |
+| Inventory-2 | MEDIUM (50) | SCHED_FIFO | 員工2 從佇列取工作 → 備貨 → 提交 |
+| Socket | MEDIUM (50) | SCHED_FIFO | select() 多工 TCP 伺服器 |
+| Display | LOW (20) | SCHED_FIFO | 驅動雙七段顯示器 |
 
-```bash
-nc <伺服器IP> 9000
-```
+---
 
-可用指令:
+## 貨物資訊
 
-- `query` — 查詢各分類庫存
-- `in med/food/goods 數量` — 進貨
-- `out med/food/goods 數量` — 出貨
-- `quit` — 離開連線
+| 貨物 | 代碼 | 優先權 | 門檻 | 備貨時間 | 初始庫存 |
+|------|------|--------|------|----------|----------|
+| 醫療物資 | med | 3（最高） | 3 | 3 秒 | 5 |
+| 生鮮食品 | food | 2 | 3 | 5 秒 | 5 |
+| 一般貨物 | goods | 1（最低） | 3 | 8 秒 | 5 |
 
-## 即時視覺化
+---
 
-```bash
-sudo apt install python3-tk
-python3 tools/warehouse_view.py
-```
+## 打卡機制
 
-以 tkinter 連到 port 9000,每秒查詢庫存並繪製倉庫場景(立體紙箱、分類圖示、警報燈)。本質上就是另一個 socket client。
+- **上班**：刷卡第一次 → 員工開始從佇列取工作處理
+- **下班**：再刷一次 → 需上班滿 **15 秒**才接受；正在備貨會**等該筆做完**才下班
+- **0 人上班**：所有進出貨指令被拒絕
+- **1 人上班**：單人序列處理
+- **2 人上班**：兩位員工平行搶佇列處理
+
+| 讀卡機 | 晶片 | 通訊 | 對應員工 |
+|--------|------|------|----------|
+| PN532 | NXP PN532 | UART (/dev/serial0) | 員工1（C 內建 libnfc） |
+| RC522 | NXP MFRC522 | SPI (/dev/spidev0.0) | 員工2（外部 Python → punch 2） |
+
+> 沒接到讀卡機時可用 socket 指令 `punch 1` / `punch 2` 模擬打卡
+
+---
+
+## 同步機制
+
+| 機制 | 用途 |
+|------|------|
+| `inv_lock`（mutex + PRIO_INHERIT） | 保護庫存陣列臨界區，防優先權反轉 |
+| `shift_lock` + `shift_cv`（cond var） | 員工上班閘門：沒打卡 → 阻塞等待 |
+| `alert_not_empty`（cond var） | 警報通道：Alert Task 等待事件 |
+| `pq_pop_priority_timed`（cond var + timeout） | 佇列取工作，0.3 秒逾時回頭檢查下班 |
+| `wstate_lock`（mutex） | 保護員工備貨狀態（給 status/視覺化） |
+| 計數號誌（mempool） | 訊息記憶體池管理 |
+| `reserved_out[]` 保留機制 | 鎖內保留 → 鎖外備貨 → 鎖內提交，防超賣 |
+
+---
+
+## 硬體接線（GPIO BCM）
+
+### 基本元件
+
+| 元件 | GPIO | 實體腳 | 備註 |
+|------|------|--------|------|
+| LED | 17 | pin 11 | 高電位亮 |
+| 蜂鳴器 | 27 | pin 13 | 高電位響 |
+| 按鈕 | 4 | pin 7 | 10kΩ 上拉至 3.3V，按下為 0 |
+
+### 七段顯示器 #1（個位）— 共陰
+
+| 段 | a | b | c | d | e | f | g |
+|----|---|---|---|---|---|---|---|
+| GPIO | 5 | 6 | 13 | 19 | 26 | 12 | 16 |
+
+### 七段顯示器 #2（十位）— 共陰
+
+| 段 | a | b | c | d | e | f | g |
+|----|---|---|---|---|---|---|---|
+| GPIO | 22 | 23 | 24 | 21 | 20 | 7 | 18 |
+
+> 原本 GPIO25/GPIO8 讓給 RC522 SPI，改用 GPIO21/GPIO20
+
+### PN532（UART → 員工1）
+
+| PN532 | Pi | 備註 |
+|-------|-----|------|
+| 5V | pin 2 (5V) | PN532 需 5V 供電 |
+| GND | pin 6 | |
+| TX | pin 10 (GPIO15 RXD) | 交叉接 |
+| RX | pin 8 (GPIO14 TXD) | 交叉接 |
+
+### RC522（SPI → 員工2）
+
+| RC522 | Pi | 備註 |
+|-------|-----|------|
+| 3.3V | pin 1 (3V3) | RC522 只能 3.3V |
+| GND | pin 6 | |
+| NSS | pin 24 (GPIO8 CE0) | 片選 |
+| SCK | pin 23 (GPIO11) | |
+| MOSI | pin 19 (GPIO10) | |
+| MISO | pin 21 (GPIO9) | |
+| RST | pin 22 (GPIO25) | |
+| IRQ | 不接 | |
+
+---
 
 ## 檔案結構
 
 ```
 warehouse/
 ├── src/
-│   ├── main.c            # 任務、優先權、警報、按鈕、Socket、主程式
-│   ├── message.h         # 訊息結構與品項型別
-│   ├── pqueue.c / .h     # 優先權佇列
-│   ├── mempool.c / .h    # 固定區塊記憶體池
-│   ├── device.h          # 裝置抽象介面
-│   ├── device_virtual.c  # 終端機模擬(VM)
-│   └── device_gpio.c     # 真實 GPIO(Pi,sysfs)
+│   ├── main.c              # 主程式（2-worker 打卡版）
+│   ├── pqueue.h             # 優先權佇列宣告
+│   ├── pqueue.c             # 優先權佇列實作（含 timed pop）
+│   ├── message.h            # 訊息結構定義
+│   ├── mempool.h            # 記憶體池宣告
+│   ├── mempool.c            # 記憶體池實作（計數號誌）
+│   ├── device.h             # 裝置介面宣告
+│   ├── device_virtual.c     # VM 空殼版（無硬體）
+│   └── device_gpio.c        # Pi 實體版（sysfs + libnfc）
 ├── tools/
-│   └── warehouse_view.py # tkinter 即時視覺化
-├── Makefile              # make / make DEVICE=gpio 切換虛擬與實體
-└── README.md
+│   ├── warehouse_view.py    # tkinter 即時視覺化（VM 上跑）
+│   └── rc522_punch.py       # RC522 讀卡 → punch 2（Pi 上跑）
+├── Makefile                 # DEVICE=virtual / DEVICE=gpio
+├── DEMO_SCRIPT.md           # Demo 腳本
+└── README.md                # 本文件
 ```
 
-## Demo 情境
+---
 
-1. **平行處理**:三個 client 幾乎同時送 `out goods/food/med 1`,觀察三個員工同時備貨、依秒數先後完成。
-2. **優先權排程**:先讓三個員工忙碌,再丟入混合優先序的訂單,觀察醫療物資被優先挑出。
-3. **並發安全**:三個 client 同時對同品項超額出貨,1 筆成功、其餘被拒,並觸發警報。
-4. **警報與人為介入**:出貨使庫存低於門檻 → LED + 蜂鳴器持續警示 → 管理員按下按鈕解除。
-5. **即時查詢**:任一 client 隨時 `query`,展示 Socket 任務獨立運作。
+## 編譯與執行
 
-## 對應課程內容
+### VM（開發 / 測試邏輯）
 
-- **多工 / 任務拆分**:五類任務各司其職、各自阻塞於不同事件而平行運作
-- **排程與優先權**:`SCHED_FIFO` 兩層優先權
-- **IPC**:訊息佇列、互斥鎖、條件變數、號誌
-- **中斷 / 非同步事件**:GPIO 按鈕觸發警報解除
-- **裝置 I/O**:GPIO 控制 LED / 蜂鳴器 / 雙七段;PN532 RFID 掃描(進行中)
-- **Socket 與記憶體管理**:TCP 多人連線、固定區塊記憶體池
+```bash
+make                     # 預設 DEVICE=virtual
+sudo ./warehouse
+```
 
-## 開發環境
+### Pi（實體部署）
 
-- Ubuntu 22.04(VirtualBox VM)、gcc、pthreads
-- Raspberry Pi 4、Raspberry Pi OS、sysfs GPIO、libnfc(RFID)
-- Python 3 + tkinter(視覺化)
+```bash
+# 事前（僅首次）
+sudo raspi-config        # 開啟 Serial Port（停用 console、啟用硬體）
+# /boot/firmware/config.txt 加：
+#   dtparam=spi=on
+#   dtoverlay=spi0-1cs
+sudo reboot
+sudo apt install libnfc-bin libnfc-dev
+sudo pip3 install mfrc522 --break-system-packages
+
+# 編譯
+make clean && make DEVICE=gpio
+
+# 啟動（需 root 取得 SCHED_FIFO 權限 + GPIO）
+sudo ./warehouse
+
+# 另開終端跑 RC522 讀卡程式
+python3 rc522_punch.py
+```
+
+### 視覺化（VM 上跑，指向 Pi IP）
+
+```bash
+python3 tools/warehouse_view.py 192.168.222.222
+```
+
+### 遠端操作
+
+```bash
+nc 192.168.222.222 9000
+```
+
+---
+
+## Socket 指令
+
+| 指令 | 說明 |
+|------|------|
+| `query` | 查詢庫存（人類可讀格式） |
+| `status` | 機器可讀狀態（視覺化用） |
+| `in med/food/goods N` | 進貨 N 個 |
+| `out med/food/goods N` | 出貨 N 個 |
+| `punch 1` | 模擬員工1 刷卡打卡 |
+| `punch 2` | 模擬員工2 刷卡打卡 |
+| `quit` | 斷線 |
+
+---
+
+## status 輸出格式
+
+```
+LOCK 1                          # 1=無人上班(等同鎖定) / 0=有人上班
+ITEM med 5 3 0                  # 代碼 現有 門檻 保留出貨
+ITEM food 5 3 0
+ITEM goods 5 3 0
+WORKER 1 off - - 0 0            # off=下班 / idle=待命 / busy=備貨中
+WORKER 2 busy med out 2.3 3     # 代碼 進出 剩餘秒 總秒
+```
+
+---
+
+## OS 概念對應
+
+| 課程概念 | 實作位置 |
+|----------|----------|
+| pthread + SCHED_FIFO | 所有 Task（7 條執行緒） |
+| Mutex + PTHREAD_PRIO_INHERIT | inv_lock（庫存臨界區） |
+| Condition Variable | alert_not_empty, shift_cv, pq not_empty |
+| 計數號誌 (Semaphore) | mempool（訊息池管理） |
+| SIGINT / SIGPIPE | 優雅關閉 / 忽略斷線訊號 |
+| select() I/O 多工 | socket_task（多 client 同時連線） |
+| Priority Queue | pq_pop_priority（貨物優先權排序） |
+| 優先權反轉防護 | PTHREAD_PRIO_INHERIT |
+| GPIO sysfs | LED、蜂鳴器、按鈕、雙七段顯示器 |
+| libnfc (UART) | PN532 讀卡（員工1 打卡） |
+| SPI + 外部程式 | RC522 讀卡 → punch 2（員工2 打卡） |
+
+---
+
+## 組員
+
+| 姓名 | 學號 |
+|------|------|
+| 李澤言 | |
+| 林彥兆 | |
+| 洪珮珈 | |
+
+---
+
+## 授權
+
+本專題為 NYCU RTOS 課程作業，僅供學術用途。
